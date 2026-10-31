@@ -42,13 +42,8 @@ config:
   layout: elk
   elk:
     mergeEdges: false
-    nodePlacementStrategy: BRANDES_KOEPF
-    considerModelOrder: NODES_AND_EDGES
   flowchart:
     wrappingWidth: 420
-    nodeSpacing: 45
-    rankSpacing: 55
-    curve: linear
 ---
 flowchart TB
     subgraph TERMINAL[" "]
@@ -61,15 +56,12 @@ flowchart TB
             ENABLE --> PC
         end
 
-        subgraph SHELL_COLUMN[" "]
+        subgraph SHELL_COLUMN["<div style='text-align:center'>开启当前终端的统一代理接管：<br/>source ~/xray/proxy.env</div>"]
             direction TB
-            TITLE["开启当前终端的统一代理接管：<br/>source ~/xray/proxy.env"]
 
             subgraph CONFIG["Shell 环境配置"]
                 ENV["修改当前 Shell 环境配置<br/>设置代理环境变量"]
             end
-
-            TITLE ~~~ ENV
         end
     end
 
@@ -85,9 +77,6 @@ flowchart TB
     PROGCONFIG --> PROXYCONFIG
     ENV --> PROXYCONFIG
 
-    %% 隐藏布局约束，不表示业务连接
-    PC ~~~ PROXYCONFIG
-
     subgraph XRAY["Xray 服务：端口监听 + 转发"]
         MIX["本机 SOCKS / HTTP 混合代理入口<br/>代理端口自动识别协议<br/>（代理端口默认 10808）"]
     end
@@ -97,7 +86,6 @@ flowchart TB
 
     MIX --> NODE["远端代理节点"]
 
-    style TITLE fill:transparent,stroke:transparent
     style SHELL_COLUMN fill:transparent,stroke:transparent
 ```
 

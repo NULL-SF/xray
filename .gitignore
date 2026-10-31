@@ -1,0 +1,11 @@
+# Local configuration and node credentials
+/config/
+# Generated state and logs
+/runtime/
+/log/
+# Local secrets and editor files
+.env
+.env.*
+*.swp
+*~
+__pycache__/

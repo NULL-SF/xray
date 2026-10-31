@@ -41,7 +41,7 @@ bash ~/xray/xray.sh <命令>
 config:
   layout: elk
   elk:
-    mergeEdges: true
+    mergeEdges: false
     nodePlacementStrategy: BRANDES_KOEPF
     considerModelOrder: NODES_AND_EDGES
   flowchart:

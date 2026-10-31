@@ -2,11 +2,11 @@
 
 > **⚠️ Agent 操作警告：不要切断当前会话正在使用的代理**
 >
-> 执行 `stop`、`restart`、`switch`，或修改当前线路、端口之前，先确认当前 Agent 会话及其他任务是否通过本项目的 SOCKS5 或 HTTP 入口联网。连接可能中断；**当前会话依赖该端口或无法确认时，不要在本会话中执行这些操作**。`status`、`test` 只能检查代理本身，不能证明当前会话没有使用它。
+> 执行 `stop`、`restart`、`switch`，或修改当前线路、端口之前，先确认当前 Agent 会话及其他任务是否通过本项目的 SOCKS 或 HTTP 入口联网。连接可能中断；**当前会话依赖该端口或无法确认时，不要在本会话中执行这些操作**。`status`、`test` 只能检查代理本身，不能证明当前会话没有使用它。
 
 ---
 
-本项目由同一个 Xray 进程在 `127.0.0.1` 提供 SOCKS5 和 HTTP 两个入口，共用当前选定节点。项目自带 Linux x86_64 版 Xray 26.1.23。流量从当前节点发出，不配置分流；`ping` 不走此代理。
+本项目由同一个 Xray 进程在 `127.0.0.1` 提供 SOCKS / HTTP 混合代理入口，同一端口自动识别协议，使用当前选定节点。项目自带 Linux x86_64 版 Xray 26.1.23。流量从当前节点发出，不配置分流；`ping` 不走此代理。
 
 管理命令格式：
 
@@ -28,18 +28,20 @@ bash ~/xray/xray.sh <命令>
 
 ### 1.3 本机端口
 
-SOCKS5 和 HTTP 端口分别写在 `config/ports/socks.txt`、`config/ports/http.txt`，各填写一个 `1–65535` 的整数。启动或执行 `source` 时都会检查端口配置：文件缺失、为空或内容无效，就使用默认端口并写回文件（SOCKS5：`10808`，HTTP：`10809`）。两个入口须使用不同且未被其他进程占用的端口。修改端口后，重启代理并重新 `source`；单独配置代理地址的程序也需更新端口。
+统一代理端口写在 `config/port.txt`，填写一个 `1–65535` 的整数，默认 `10808`，SOCKS 和 HTTP 共用。启动或执行 `source` 时都会检查端口配置：文件缺失、为空或内容无效，就使用默认端口并写回文件。修改端口后，重启代理并重新 `source`；单独配置代理地址的程序也需更新端口。
 
 ## 2 代理架构
 
-`source` 配置当前 Shell 的代理环境，并为后续适用程序启用 ProxyChains；它不启动 Xray 服务。图中的代理配置由支持它的程序读取后使用，环境变量本身不转发流量。
+执行 `source ~/xray/proxy.env` 会配置当前 Shell 的代理环境变量，并通过 ProxyChains 为当前终端后续运行的程序启用 TCP 接管。这些设置作用于当前终端后续运行的命令及其子进程。
+
+支持代理环境变量的程序可以独立配置代理，无需执行 `source`。
 
 ```mermaid
 ---
 config:
   layout: elk
   elk:
-    mergeEdges: false
+    mergeEdges: true
     nodePlacementStrategy: BRANDES_KOEPF
     considerModelOrder: NODES_AND_EDGES
   flowchart:
@@ -55,7 +57,7 @@ flowchart TB
         subgraph INTERCEPT["终端 TCP 接管"]
             direction TB
             ENABLE["配置 ProxyChains 预加载<br/>为后续适用程序启用 TCP 拦截"]
-            PC["接管的 TCP 连接统一转 SOCKS5<br/>本机回环连接放行，避免重复代理"]
+            PC["接管的 TCP 连接统一转 SOCKS<br/>本机回环连接放行，避免代理"]
             ENABLE --> PC
         end
 
@@ -78,34 +80,28 @@ flowchart TB
         PROGRAM --> PROGCONFIG
     end
 
-    SC["SOCKS5 代理配置<br/>（环境变量示例：<br/>ALL_PROXY / all_proxy）"]
-    HC["HTTP 代理配置<br/>（环境变量示例：<br/>HTTP_PROXY / http_proxy<br/>HTTPS_PROXY / https_proxy）"]
+    PROXYCONFIG["代理环境变量配置<br/>SOCKS：socks5h://127.0.0.1:代理端口<br/>HTTP：http://127.0.0.1:代理端口<br/>NO_PROXY：localhost,127.0.0.1,::1"]
 
-    ENV --> SC
-    ENV --> HC
-    PROGCONFIG --> SC
-    PROGCONFIG --> HC
+    PROGCONFIG --> PROXYCONFIG
+    ENV --> PROXYCONFIG
+
+    %% 隐藏布局约束，不表示业务连接
+    PC ~~~ PROXYCONFIG
 
     subgraph XRAY["Xray 服务：端口监听 + 转发"]
-        direction LR
-        SOCKS["本机 SOCKS5 监听入口<br/>（默认 127.0.0.1:10808）"]
-        HTTP["本机 HTTP 监听入口<br/>（默认 127.0.0.1:10809）"]
+        MIX["本机 SOCKS / HTTP 混合代理入口<br/>代理端口自动识别协议<br/>（代理端口默认 10808）"]
     end
 
-    PC --> SOCKS
-    SC --> SOCKS
-    HC --> HTTP
+    PC --> MIX
+    PROXYCONFIG --> MIX
 
-    SOCKS --> NODE["远端代理节点"]
-    HTTP --> NODE
+    MIX --> NODE["远端代理节点"]
 
     style TITLE fill:transparent,stroke:transparent
     style SHELL_COLUMN fill:transparent,stroke:transparent
 ```
 
-接入后，HTTP/HTTPS 代理变量指向 HTTP 入口，`ALL_PROXY/all_proxy` 指向 SOCKS5 入口；ProxyChains 将可接管的 TCP 连接转到 SOCKS5。本机回环连接放行，避免重复代理。
-
-这些设置只影响当前终端及随后继承环境的程序，不能保证所有程序或 UDP 流量都走代理。`NO_PROXY/no_proxy` 保留原有例外并补充本机地址，但非回环例外仍可能被 ProxyChains 接管。
+**注意：** 本机回环连接仍保持直连。且该方案不能保证覆盖所有程序或 UDP 流量。
 
 ## 3 命令
 
@@ -115,7 +111,7 @@ flowchart TB
 
 | 命令 | 说明 |
 |---|---|
-| `bash ~/xray/xray.sh start` | 按当前线路在后台启动 SOCKS5 和 HTTP 双入口，并检查连接。服务已运行且入口与配置一致时不重复启动，也不重新加载线路或链接；入口不一致时提示检查。断开 SSH 后继续运行。 |
+| `bash ~/xray/xray.sh start` | 按当前线路在后台启动 SOCKS / HTTP 混合代理入口，并检查连接。服务已运行且入口与配置一致时不重复启动，也不重新加载线路或链接；入口不一致时提示检查。启动后保持后台运行。 |
 | `bash ~/xray/xray.sh stop` | 停止服务，使用该代理的连接会断开。 |
 | `bash ~/xray/xray.sh restart` | 停止服务，再按当前线路和配置启动，并检查连接。 |
 | `bash ~/xray/xray.sh switch` | 选择线路，通过端口预检并停止旧服务后保存选择，再启动服务、检查连接。选择当前线路也会重启；新线路不可用时不会自动退回。 |
@@ -127,12 +123,12 @@ flowchart TB
 | 命令 | 说明 |
 |---|---|
 | `bash ~/xray/xray.sh status` | 查看线路、端口监听、进程 PID、开机自启和终端自动接入设置，不修改配置。 |
-| `bash ~/xray/xray.sh test` | 分别测试 HTTP、SOCKS5 入口，显示连接结果和访问 Google 的首字节耗时；任一入口失败，命令返回失败。不切换或重启服务。 |
+| `bash ~/xray/xray.sh test` | 分别测试 HTTP 和 SOCKS 代理，均访问 `https://www.google.com`，显示连接结果和首字节耗时；任一代理测试失败，命令返回失败。不改线路，也不启停监听。 |
 | `bash ~/xray/xray.sh log` | 持续查看 `log/xray.log`，按 `Ctrl+C` 退出查看。 |
 
-**端口监听不等于节点可用。**`start` 新启动服务，以及 `restart`、`switch` 后，都会执行与 `test` 相同的连接检查。HTTP 入口测试 HTTP 和 HTTPS 请求，SOCKS5 入口测试 HTTPS 请求；请求正常完成且最终返回 HTTP 200 才算成功。Hysteria2、VLESS、VMess 使用同一测试标准。需要在脚本中用退出码判断联网是否成功时，使用 `test`；`start`、`restart`、`switch` 的联网检查失败不会自动停止已启动的服务，也不会因此返回失败。
+**端口监听不等于节点可用。**`start` 新启动服务，以及 `restart`、`switch` 后，都会执行与 `test` 相同的连接检查。请求正常完成且最终返回 HTTP 200 才算成功。Hysteria2、VLESS、VMess 使用同一测试标准。需要在脚本中用退出码判断联网是否成功时，使用 `test`；`start`、`restart`、`switch` 的联网检查失败不会自动停止已启动的服务，也不会因此返回失败。
 
-每个入口的耗时均来自访问 `https://www.google.com` 的 HTTPS 请求，表示响应延迟，不是节点 RTT 或下载速度。请求失败时显示“未测得”，详细原因写入日志。HTTP 入口若仅 HTTP 请求失败，仍可显示已成功的 HTTPS 请求耗时。
+首字节耗时表示响应延迟，不是节点 RTT 或下载速度。请求失败时显示“未测得”，详细原因写入日志。
 
 ### 3.3 当前终端接入
 
@@ -140,7 +136,7 @@ flowchart TB
 
 | 命令 | 说明 |
 |---|---|
-| `source ~/xray/proxy.env` | 为当前终端设置代理环境并启用 ProxyChains；服务双入口未就绪时会报错。 |
+| `source ~/xray/proxy.env` | 为当前终端设置代理环境并启用 ProxyChains；混合代理入口未就绪时会报错。 |
 | `source ~/xray/proxy.env off` | 在启用代理的同一 Shell 中取消代理注入，恢复启用前保存的环境；不停止 Xray 服务。 |
 
 `source` 不启动服务，`stop` 也不会清除已有终端的代理环境。重复 `source` 不会覆盖第一次保存的环境。
@@ -164,8 +160,7 @@ flowchart TB
 | `scripts/xray-service.sh` | `start` 和开机任务调用的后台启动脚本。 | 不改 |
 | `scripts/terminal-env.sh` | 管理脚本和终端代理共用的环境及端口处理函数。 | 不改 |
 | `bin/xray_26.1.23` | Xray 核心程序。 | 不改 |
-| `config/ports/socks.txt` | 本机 SOCKS5 端口。 | 需要换端口时改 |
-| `config/ports/http.txt` | 本机 HTTP 端口。 | 需要换端口时改 |
+| `config/port.txt` | 本机 SOCKS / HTTP 统一代理端口。 | 需要换端口时改 |
 | `config/active.txt` | 当前线路名：`vless`、`vmess` 或 `hysteria2`。 | 选线路时优先使用 `switch` |
 | `config/links/vless.txt` | VLESS 节点链接，一行。 | 使用或更换 VLESS 时改 |
 | `config/links/vmess.txt` | VMess 节点链接，一行。 | 使用或更换 VMess 时改 |
@@ -312,19 +307,19 @@ chmod u+x ~/xray/xray.sh ~/xray/scripts/xray-service.sh ~/xray/bin/xray_26.1.23
 
 节点链接文件及 `runtime/xray_config.json` 含连接凭据，只在自己的机器之间私下迁移。运行配置和 PID 无需作为迁移依据，脚本会按目标目录重新生成或核对；不要把节点链接粘贴进公开教程。
 
-在新服务器上，至少填好 `config/active.txt` 指定线路的链接；其他线路的链接可稍后再填。确认 `config/ports/socks.txt` 和 `config/ports/http.txt` 后，先启动代理：
+在新服务器上，至少填好 `config/active.txt` 指定线路的链接；其他线路的链接可稍后再填。确认 `config/port.txt` 后，先启动代理：
 
 ```bash
 bash ~/xray/xray.sh start
 ```
 
-确认 `start` 报告两个入口均连接正常后，再登记开机启动：
+确认 `start` 报告 HTTP、SOCKS 两种协议均连接正常后，再登记开机启动：
 
 ```bash
 bash ~/xray/xray.sh boot
 ```
 
-在 `boot` 的提示中选择开启。它只登记开机任务；当前代理由 `start` 启动，SSH 断开后继续运行。
+在 `boot` 的提示中选择开启。它只登记开机任务；当前代理由 `start` 启动，启动后保持后台运行。
 
 若新打开的终端也要自动接入代理，再执行 `bash ~/xray/xray.sh terminal` 并选择开启。这一步设置该用户的 `~/.bashrc` 和项目内的启用标记，不启动代理。只让当前窗口接入代理时，执行 `source ~/xray/proxy.env`；关闭当前窗口的代理时，执行 `source ~/xray/proxy.env off`。
 
@@ -336,16 +331,16 @@ bash ~/xray/xray.sh boot
 
 ### 7.2 代理配置
 
-安装插件或 CLI 后，`.env` 和 `config.toml` 不保证自动存在。在服务器终端执行 `mkdir -p ~/.codex`，然后用 VS Code 打开服务器上的 `~/.codex/`：文件不存在就新建，已存在就先备份、再修改原文件。如果设置过 `CODEX_HOME`，改用它指定的目录。下面代码块是**文件内容，不是要在终端执行的命令**。以下示例使用 HTTP `10809`、SOCKS5 `10808`，须分别与 `config/ports/http.txt`、`config/ports/socks.txt` 一致；使用前确认 Xray 双入口已经启动。
+安装插件或 CLI 后，`.env` 和 `config.toml` 不保证自动存在。在服务器终端执行 `mkdir -p ~/.codex`，然后用 VS Code 打开服务器上的 `~/.codex/`：文件不存在就新建，已存在就先备份、再修改原文件。如果设置过 `CODEX_HOME`，改用它指定的目录。下面代码块是**文件内容，不是要在终端执行的命令**。以下示例的 HTTP 和 SOCKS 共用 `10808`，须与 `config/port.txt` 一致；使用前确认 Xray 混合代理入口已经启动。
 
 `~/.codex/.env`：若不存在，新建并写入以下八行；若已存在，将同名变量的值改为以下内容，缺少的变量再补上。每个变量只保留一条，其他原有内容保留。
 
 ```dotenv
-HTTP_PROXY=http://127.0.0.1:10809
-HTTPS_PROXY=http://127.0.0.1:10809
+HTTP_PROXY=http://127.0.0.1:10808
+HTTPS_PROXY=http://127.0.0.1:10808
 ALL_PROXY=socks5h://127.0.0.1:10808
-http_proxy=http://127.0.0.1:10809
-https_proxy=http://127.0.0.1:10809
+http_proxy=http://127.0.0.1:10808
+https_proxy=http://127.0.0.1:10808
 all_proxy=socks5h://127.0.0.1:10808
 NO_PROXY=127.0.0.1,localhost,::1
 no_proxy=127.0.0.1,localhost,::1
@@ -377,6 +372,6 @@ exclude = [
 shell_snapshot = false
 ```
 
-这段配置从 Codex 执行命令的环境中排除上述八个代理变量（[官方环境策略说明](https://developers.openai.com/codex/config-advanced/#shell-environment-policy)），并关闭可能把它们重新带回的终端快照。关闭快照可能让命令启动变慢，也可能影响原本靠快照恢复的别名和函数；设置后请检查常用命令。其他代理机制（如 `LD_PRELOAD` 或程序自己的代理设置）不由这八个排除项控制。
+这段配置从 Codex 执行命令的环境中排除上述八个代理变量（[官方环境策略说明](https://developers.openai.com/codex/config-advanced/#shell-environment-policy)），并关闭可能把它们重新带回的终端快照（关闭快照后命令启动可能稍慢）。其他代理机制（如 `LD_PRELOAD` 或程序自己的代理设置）不由这八个排除项控制。
 
 保存配置后，重启 Codex 以加载新配置。若 Codex 被设置为断开 SSH 后继续运行，重连 SSH 不能代替重启。

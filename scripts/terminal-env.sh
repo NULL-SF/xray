@@ -23,66 +23,47 @@ _xray_remove_preload() {
   return 0
 }
 
-# 只读加载：缺失、空白、非法端口按协议回退；状态查询不写文件。
+# 只读加载统一端口；缺失、空白或非法时回退，状态查询不写文件。
 _xray_load_ports() {
-  local root="$1" kind value file fallback defaulted
-  SOCKS_PORT_DEFAULTED=0 HTTP_PORT_DEFAULTED=0
-  for kind in socks http; do
-    file="$root/config/ports/$kind.txt"
-    value="" defaulted=0
-    if [[ -e "$file" && ( ! -f "$file" || ! -r "$file" ) ]]; then
-      printf '端口配置不是可读的普通文件：%s\n' "$file" >&2
+  local root="$1" value="" file
+  PROXY_PORT_DEFAULTED=0
+  file="$root/config/port.txt"
+  if [[ -e "$file" && ( ! -f "$file" || ! -r "$file" ) ]]; then
+    printf '端口配置不是可读的普通文件：%s\n' "$file" >&2
+    return 1
+  fi
+  [[ ! -r "$file" ]] || value=$(<"$file")
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || (( 10#$value < 1 || 10#$value > 65535 )); then
+    value=10808
+    PROXY_PORT_DEFAULTED=1
+  fi
+  PROXY_PORT=$((10#$value))
+}
+
+# 启动/切换/终端接入时保存默认回退值；有效配置保持不变。
+_xray_ensure_ports() {
+  local root="$1" temporary
+  _xray_load_ports "$root" || return 1
+  if [[ "$PROXY_PORT_DEFAULTED" == 1 ]]; then
+    mkdir -p "$root/config" || return 1
+    temporary=$(mktemp "$root/config/.port.XXXXXX") || return 1
+    if ! printf '%s\n' "$PROXY_PORT" > "$temporary" || ! mv -f -- "$temporary" "$root/config/port.txt"; then
+      rm -f -- "$temporary"
       return 1
     fi
-    [[ ! -r "$file" ]] || value=$(<"$file")
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    if [[ "$kind" == socks ]]; then fallback=10808; else fallback=10809; fi
-    if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || (( 10#$value < 1 || 10#$value > 65535 )); then
-      value="$fallback"
-      defaulted=1
-    fi
-    if [[ "$kind" == socks ]]; then
-      SOCKS_PORT=$((10#$value))
-      SOCKS_PORT_DEFAULTED="$defaulted"
-    else
-      HTTP_PORT=$((10#$value))
-      HTTP_PORT_DEFAULTED="$defaulted"
-    fi
-  done
-  [[ "$SOCKS_PORT" != "$HTTP_PORT" ]] || { printf 'SOCKS5 与 HTTP 端口不能相同（包括默认回退后冲突）。\n' >&2; return 1; }
+    printf '统一代理端口已写入 config/port.txt：%s。\n' "$PROXY_PORT" >&2
+  fi
 }
 
-# 仅启动/切换/终端接入时保存回退值；有效的用户配置保持不变。
-_xray_ensure_ports() {
-  local root="$1" kind defaulted value temporary label
-  _xray_load_ports "$root" || return 1
-  mkdir -p "$root/config/ports" || return 1
-  for kind in socks http; do
-    if [[ "$kind" == socks ]]; then
-      defaulted="$SOCKS_PORT_DEFAULTED" value="$SOCKS_PORT"
-    else
-      defaulted="$HTTP_PORT_DEFAULTED" value="$HTTP_PORT"
-    fi
-    if [[ "$defaulted" == 1 ]]; then
-      temporary=$(mktemp "$root/config/ports/.$kind.XXXXXX") || return 1
-      if ! printf '%s\n' "$value" > "$temporary" || ! mv -f -- "$temporary" "$root/config/ports/$kind.txt"; then
-        rm -f -- "$temporary"
-        return 1
-      fi
-      if [[ "$kind" == socks ]]; then label=SOCKS5; else label=HTTP; fi
-      printf '%s 端口配置缺失、为空或无效，已写入默认值 %s。\n' "$label" "$value" >&2
-    fi
-  done
-}
-
-# 仅核对本项目运行进程、生成配置和双入口；不启停服务，也不证明节点可联网。
+# 检查统一入口；旧双入口进程可继续接入，移除旧 HTTP 监听需用户择机重启。
 _xray_check_running_ports() {
-  _xray_check_ports ready "$1" "$2" "$3"
+  _xray_check_ports ready "$1" "$2"
 }
 
 _xray_check_available_ports() {
-  _xray_check_ports available "$1" "$2" "$3"
+  _xray_check_ports available "$1" "$2"
 }
 
 _xray_check_ports() {
@@ -110,44 +91,50 @@ def owned_ports(root):
             continue  # 核心可能正在关闭另一个连接。
         if target.startswith('socket:['):
             inodes.add(target[8:-1])
-    ports = set()
-    for row in (proc / 'net/tcp').read_text().splitlines()[1:]:
-        fields = row.split()
-        host, port = fields[1].split(':')
-        if fields[3] == '0A' and host == '0100007F' and fields[9] in inodes:
-            ports.add(int(port, 16))
+    ports = {'tcp': set(), 'udp': set()}
+    for network in ports:
+        for row in (proc / f'net/{network}').read_text().splitlines()[1:]:
+            fields = row.split()
+            host, port = fields[1].split(':')
+            bound = fields[3] == ('0A' if network == 'tcp' else '07')
+            if bound and host == '0100007F' and fields[9] in inodes:
+                ports[network].add(int(port, 16))
     return ports
 
 
 def main():
-    mode, directory, socks, http = sys.argv[1:]
+    mode, directory, port = sys.argv[1:]
     root = Path(directory)
-    expected = {'socks': int(socks), 'http': int(http)}
+    expected = {'socks': int(port)}
     if mode == 'ready':
         ports = owned_ports(root)
         cfg = json.loads((root / 'runtime/xray_config.json').read_text())
         actual = {i['protocol']: i['port'] for i in cfg['inbounds']
                   if i.get('listen') == '127.0.0.1'}
-        if actual != expected:
-            raise ValueError('运行入口与端口配置不一致（可能尚未启用双入口或修改后未重启）')
-        if not set(expected.values()) <= ports:
-            raise ValueError('双入口未全部由本项目核心监听')
+        if actual.get('socks') != expected['socks'] or set(actual) - {'socks', 'http'}:
+            raise ValueError('运行入口与统一端口配置不一致，请择机重启后再接入')
+        if 'http' in actual:
+            print('当前核心仍有旧独立 HTTP 入口；统一端口可用，择机重启后移除旧入口。', file=sys.stderr)
+        if not set(expected.values()) <= ports['tcp']:
+            raise ValueError('统一代理端口未由本项目核心监听')
     elif mode == 'available':
         try:
             ports = owned_ports(root)
         except (OSError, ValueError, IndexError):
-            ports = set()
-        for kind, port in expected.items():
-            if port in ports:
+            ports = {'tcp': set(), 'udp': set()}
+        port = expected['socks']
+        for network, socket_type in (('tcp', socket.SOCK_STREAM), ('udp', socket.SOCK_DGRAM)):
+            if port in ports[network]:
                 continue
             try:
-                with socket.socket() as sock:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                with socket.socket(socket.AF_INET, socket_type) as sock:
+                    if socket_type == socket.SOCK_STREAM:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     sock.bind(('127.0.0.1', port))
-                    sock.listen(1)
+                    if socket_type == socket.SOCK_STREAM:
+                        sock.listen(1)
             except OSError as exc:
-                label = {'socks': 'SOCKS5', 'http': 'HTTP'}[kind]
-                raise ValueError(f'{label} 端口 127.0.0.1:{port} 不可用：{exc.strerror}；未停止现有服务') from None
+                raise ValueError(f'SOCKS / HTTP 混合代理 {network.upper()} 端口 127.0.0.1:{port} 不可用：{exc.strerror}；未停止现有服务') from None
     else:
         raise ValueError('未知端口检查模式')
 

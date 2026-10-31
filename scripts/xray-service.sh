@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 核心入口。读取 config/active.txt 与对应链接，生成临时配置后执行 Xray 核心。
-# vless、vmess、hysteria2 都执行 bin/xray_26.1.23，监听 config/ports/ 中配置的 SOCKS5 和 HTTP 端口。
-# 双入口端口由 config/ports/ 配置；缺失或非法时回退到 10808/10809。
+# vless、vmess、hysteria2 都执行 bin/xray_26.1.23，使用统一 SOCKS / HTTP 入口。
+# 端口由 config/port.txt 配置，缺失或非法时回退到 10808。
 # 链接为空或无法识别时仍然监听。外部连接不会成功，进程不退出，不改线路。
 # 标准错误进入调用方的日志。运行配置在项目目录 runtime，不要手改。
 set -euo pipefail
@@ -39,8 +39,8 @@ unset _xray_name _xray_link
 
 # 保存默认端口回退值；当前线路为空时写默认值。节点链接只在缺失时创建空文件。
 _xray_ensure_ports "$ROOT" || exit 1
-PORT="$SOCKS_PORT"
-export XRAY_PORT="$SOCKS_PORT" XRAY_HTTP_PORT="$HTTP_PORT"
+PORT="$PROXY_PORT"
+export XRAY_PORT="$PROXY_PORT"
 raw=""
 if [[ -r "$ACTIVE" ]]; then
   raw="$(tr -d '[:space:]' < "$ACTIVE")"
@@ -60,12 +60,9 @@ case "$raw" in
   *) die "无法识别的线路: ${raw}。应为 vless、vmess 或 hysteria2。" ;;
 esac
 
-for PORT in "$SOCKS_PORT" "$HTTP_PORT"; do
 if ss -lnt 2>/dev/null | grep "127\\.0\\.0\\.1:${PORT}[[:space:]]" >/dev/null; then
   die "127.0.0.1:${PORT} 已被其他进程占用"
 fi
-done
-PORT="$SOCKS_PORT"
 echo $$ > "${ROOT}/runtime/xray.pid"
 trap 'rm -f "${ROOT}/runtime/xray.pid"' EXIT
 
@@ -99,7 +96,7 @@ cfg = {
         "listen": "127.0.0.1",
         "protocol": "socks",
         "settings": {"udp": True},
-    }, {"listen": "127.0.0.1", "port": int(os.environ["XRAY_HTTP_PORT"]), "protocol": "http", "settings": {}}],
+    }],
     "outbounds": [{"protocol": "blackhole", "settings": {"response": {"type": "none"}}}],
 }
 target = Path(sys.argv[1])
@@ -108,8 +105,8 @@ temporary.write_text(json.dumps(cfg, indent=2) + "\n")
 temporary.replace(target)
 PY
   chmod 600 "$XRAY_CONFIG"
-  printf '%s [xray] 链接无法使用，将启动双入口并拒绝转发外部连接。\n' "$(date '+%Y/%m/%d %H:%M:%S')" >&2
-  printf '%s [xray] 启动 Xray，线路 %s，SOCKS5 入口 127.0.0.1:%s，HTTP 入口 127.0.0.1:%s。\n' "$(date '+%Y/%m/%d %H:%M:%S')" "$profile" "$SOCKS_PORT" "$HTTP_PORT" >&2
+  printf '%s [xray] 链接无法使用，将启动混合代理入口并拒绝转发外部连接。\n' "$(date '+%Y/%m/%d %H:%M:%S')" >&2
+  printf '%s [xray] 启动 Xray，线路 %s，SOCKS / HTTP 混合代理入口 127.0.0.1:%s。\n' "$(date '+%Y/%m/%d %H:%M:%S')" "$profile" "$PROXY_PORT" >&2
   exec "$XRAY_BIN" run -config "$XRAY_CONFIG"
 }
 
@@ -694,7 +691,7 @@ def parse_link(profile, link, port=10808):
 
 
 def config(outbound, port):
-    return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": integer(port, 1), "protocol": "socks", "settings": {"udp": True}}, {"listen": "127.0.0.1", "port": int(os.environ["XRAY_HTTP_PORT"]), "protocol": "http", "settings": {}}], "outbounds": [outbound]}
+    return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": integer(port, 1), "protocol": "socks", "settings": {"udp": True}}], "outbounds": [outbound]}
 
 
 def main():
@@ -728,5 +725,5 @@ chmod 600 "$XRAY_CONFIG"
 if ! "$XRAY_BIN" -test -config "$XRAY_CONFIG" >/dev/null; then
   listen_anyway
 fi
-printf '%s [xray] 启动 Xray，线路 %s，SOCKS5 入口 127.0.0.1:%s，HTTP 入口 127.0.0.1:%s。\n' "$(date '+%Y/%m/%d %H:%M:%S')" "$profile" "$SOCKS_PORT" "$HTTP_PORT" >&2
+printf '%s [xray] 启动 Xray，线路 %s，SOCKS / HTTP 混合代理入口 127.0.0.1:%s。\n' "$(date '+%Y/%m/%d %H:%M:%S')" "$profile" "$PROXY_PORT" >&2
 exec "$XRAY_BIN" run -config "$XRAY_CONFIG"

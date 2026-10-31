@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 管理 127.0.0.1 上 config/ports/ 中配置的 SOCKS5 与 HTTP 双入口。
+# 管理 127.0.0.1 上的 SOCKS / HTTP 混合入口，端口见 config/port.txt。
 # vless、vmess、hysteria2 均使用 bin/xray_26.1.23。当前线路见 config/active.txt。
 # 开机自启写在该用户的 crontab，到点执行 scripts/xray-service.sh。start 也是把这个脚本放进后台。
 # 操作结果写入 log/xray.log。询问与 status 只显示在终端。
@@ -22,21 +22,21 @@ TERMINAL_FLAG="${ROOT}/config/terminal.on"
 BASHRC="${HOME}/.bashrc"
 load_port() {
   _xray_load_ports "$ROOT" || return 1
-  PORT="$SOCKS_PORT"
+  PORT="$PROXY_PORT"
 }
 PORT_CONFIG_VALID=1
 if ! load_port; then
   case "${1:-}" in
     status|stop|log)
       PORT_CONFIG_VALID=0
-      PORT=0 SOCKS_PORT=0 HTTP_PORT=0
+      PORT=0 PROXY_PORT=0
       ;;
     *) exit 1 ;;
   esac
 fi
 ensure_port() {
   _xray_ensure_ports "$ROOT" || return 1
-  PORT="$SOCKS_PORT"
+  PORT="$PROXY_PORT"
 }
 
 lock_management() {
@@ -54,7 +54,7 @@ sync_proxychains() {
   local tmp_config
   tmp_config="$(mktemp "${ROOT}/runtime/.proxychains.conf.XXXXXX")" || return 1
   if ! cat > "$tmp_config" <<EOF
-# 由 xray.sh 根据 config/ports/socks.txt 生成到 runtime。不要手改。
+# 由 xray.sh 根据 config/port.txt 生成到 runtime。不要手改。
 # 仅在 source proxy.env 之后生效。
 strict_chain
 proxy_dns
@@ -190,24 +190,20 @@ set_cron() {
 start_proxy() {
   if port_open; then
     if ! own_listener; then
-      note "启动失败：127.0.0.1:${PORT} 已由其他进程占用。请先在 config/ports/socks.txt 设置空闲端口。"
+      note "启动失败：127.0.0.1:${PORT} 已由其他进程占用。请先在 config/port.txt 设置空闲端口。"
       return 1
     fi
     FRESH_START=0
-    _xray_check_running_ports "$ROOT" "$SOCKS_PORT" "$HTTP_PORT" || return 1
+    _xray_check_running_ports "$ROOT" "$PROXY_PORT" || return 1
     sync_proxychains || return 1
-    note "双入口已在监听，未重复启动。"
+    note "混合代理入口已在监听，未重复启动。"
     return 0
   fi
   if daemon_alive; then
     note "核心进程已在运行，127.0.0.1:${PORT} 尚未监听。详见 ${LOG}"
     return 1
   fi
-  if ( PORT="$HTTP_PORT"; port_open ); then
-    note "启动失败：HTTP 端口 ${HTTP_PORT} 已被占用。"
-    return 1
-  fi
-  _xray_check_available_ports "$ROOT" "$SOCKS_PORT" "$HTTP_PORT" || return 1
+  _xray_check_available_ports "$ROOT" "$PROXY_PORT" || return 1
   # 核心不能持有管理锁，否则后续 stop/restart 会一直等待。
   mkdir -p "${ROOT}/log"
   ( exec {MANAGEMENT_LOCK}>&-; exec nohup "${ROOT}/scripts/xray-service.sh" ) >> "$LOG" 2>&1 < /dev/null &
@@ -217,45 +213,43 @@ start_proxy() {
   # 启动程序已经退出时不再继续等，原因在日志里。
   local i
   for i in $(seq 1 40); do
-    if port_open && ( PORT="$HTTP_PORT"; port_open ); then
-      if ! own_listener || ! ( PORT="$HTTP_PORT"; own_listener ); then
-        note "启动失败：SOCKS5 或 HTTP 入口被其他进程占用。"
+    if port_open; then
+      if ! own_listener; then
+        note "启动失败：混合代理入口被其他进程占用。"
         return 1
       fi
-      note "已启动。线路 $(current_profile)（$(core_for "$(current_profile)")），监听 SOCKS5 127.0.0.1:${SOCKS_PORT}、HTTP 127.0.0.1:${HTTP_PORT}。"
+      note "已启动。线路 $(current_profile)（$(core_for "$(current_profile)")），监听 127.0.0.1:${PROXY_PORT}（SOCKS / HTTP 混合代理）。"
       sync_proxychains || return 1
       FRESH_START=1
       return 0
     fi
     if ! kill -0 "$child" 2>/dev/null; then
-      note "启动失败：SOCKS5 和 HTTP 双入口未全部就绪。详见 ${LOG}"
+      note "启动失败：SOCKS / HTTP 混合代理入口未就绪。详见 ${LOG}"
       return 1
     fi
     sleep 1
   done
   if daemon_alive; then
-    note "40 秒内 SOCKS5 和 HTTP 双入口未全部就绪。核心进程仍在启动。详见 ${LOG}"
+    note "40 秒内 SOCKS / HTTP 混合代理入口未就绪。核心进程仍在启动。详见 ${LOG}"
   else
-    note "启动失败：40 秒内 SOCKS5 和 HTTP 双入口未全部就绪。详见 ${LOG}"
+    note "启动失败：40 秒内 SOCKS / HTTP 混合代理入口未就绪。详见 ${LOG}"
   fi
   return 1
 }
 
 # 只结束本项目的进程；配置端口上的其他进程不属于停止范围。
 stop_proxy() {
-  local pid port attempt
+  local pid attempt
   if daemon_alive; then
     pid="$(tr -d '[:space:]' < "$PIDFILE")"
     kill_tree "$pid"
   fi
-  for port in "$SOCKS_PORT" "$HTTP_PORT"; do
-    if ( PORT="$port"; own_listener ); then
-      pid="$(PORT="$port"; listener_pid)"
-      kill_tree "$pid"
-    fi
-  done
+  if own_listener; then
+    pid="$(listener_pid)"
+    kill_tree "$pid"
+  fi
   for attempt in {1..30}; do
-    if ! daemon_alive && ! own_listener && ! ( PORT="$HTTP_PORT"; own_listener ); then
+    if ! daemon_alive && ! own_listener; then
       rm -f "$PIDFILE"
       note "本项目核心已停止。"
       return 0
@@ -276,23 +270,23 @@ report_connection() {
   local urls=() proxy_args=()
   for kind in http socks; do
     if [[ "$kind" == http ]]; then
-      label=HTTP port="$HTTP_PORT"
-      urls=(http://www.google.com "$PROBE_URL")
-      proxy_args=(--proxy "http://127.0.0.1:${HTTP_PORT}")
-    else
-      label=SOCKS5 port="$SOCKS_PORT"
+      label=HTTP port="$PROXY_PORT"
       urls=("$PROBE_URL")
-      proxy_args=(--socks5-hostname "127.0.0.1:${SOCKS_PORT}")
+      proxy_args=(--proxy "http://127.0.0.1:${PROXY_PORT}")
+    else
+      label=SOCKS port="$PROXY_PORT"
+      urls=("$PROBE_URL")
+      proxy_args=(--socks5-hostname "127.0.0.1:${PROXY_PORT}")
     fi
     ms="未测得"
-    # 分别核对入口归属；一个入口异常不跳过另一个入口的检查。
+    # 同一监听端口，分别验证 HTTP 与 SOCKS 协议。
     if ! ( PORT="$port"; port_open ); then
-      note "${label} 入口：连接失败，127.0.0.1:${port} 未在监听；访问 ${PROBE_URL} 的首字节耗时：未测得。"
+      note "${label} 代理：连接失败，127.0.0.1:${port} 未在监听；访问 ${PROBE_URL} 的首字节耗时：未测得。"
       failed=1
       continue
     fi
     if ! ( PORT="$port"; own_listener ); then
-      note "${label} 入口：连接失败，127.0.0.1:${port} 被其他进程占用；访问 ${PROBE_URL} 的首字节耗时：未测得。"
+      note "${label} 代理：连接失败，127.0.0.1:${port} 被其他进程占用；访问 ${PROBE_URL} 的首字节耗时：未测得。"
       failed=1
       continue
     fi
@@ -301,23 +295,23 @@ report_connection() {
       if ! result="$(curl -sS -L --noproxy '' "${proxy_args[@]}" \
         --connect-timeout 12 --max-time 20 -o /dev/null \
         -w '%{http_code} %{time_starttransfer}' "$url" 2>/dev/null)"; then
-        note "${label} 入口访问 ${url} 失败（连接、TLS 或传输未完成）。" >/dev/null
+        note "${label} 代理访问 ${url} 失败（连接、TLS 或传输未完成）。" >/dev/null
         entry_failed=1
         continue
       fi
       code="${result%% *}"
       secs="${result#* }"
       if [[ "$code" != 200 ]]; then
-        note "${label} 入口访问 ${url} 失败（响应 ${code}）。" >/dev/null
+        note "${label} 代理访问 ${url} 失败（响应 ${code}）。" >/dev/null
         entry_failed=1
       elif [[ "$url" == "$PROBE_URL" && "$secs" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         ms="$(awk -v t="$secs" 'BEGIN { printf "%d", t * 1000 }') 毫秒"
       fi
     done
     if [[ "$entry_failed" == 0 ]]; then
-      note "${label} 入口：连接正常；访问 ${PROBE_URL} 的首字节耗时：${ms}。"
+      note "${label} 代理：连接正常；访问 ${PROBE_URL} 的首字节耗时：${ms}。"
     else
-      note "${label} 入口：连接失败；访问 ${PROBE_URL} 的首字节耗时：${ms}。详见日志。"
+      note "${label} 代理：连接失败；访问 ${PROBE_URL} 的首字节耗时：${ms}。详见日志。"
       failed=1
     fi
   done
@@ -344,7 +338,7 @@ switch_xray() {
   esac
   lock_management
   ensure_port
-  _xray_check_available_ports "$ROOT" "$SOCKS_PORT" "$HTTP_PORT" || return 1
+  _xray_check_available_ports "$ROOT" "$PROXY_PORT" || return 1
   current="$(current_profile)"
   if [[ "$choice" == "$current" ]]; then
     note "当前已是 ${current}，按重启处理。"
@@ -501,49 +495,36 @@ status_xray() {
     echo "终端自动接入代理: 关"
   fi
   echo "日志: ${LOG}"
-  if [[ "${SOCKS_PORT_DEFAULTED:-0}" == 1 ]]; then
-    echo "SOCKS5 端口配置缺失、为空或无效，按默认 10808 查询；未写入文件。"
-  fi
-  if [[ "${HTTP_PORT_DEFAULTED:-0}" == 1 ]]; then
-    echo "HTTP 端口配置缺失、为空或无效，按默认 10809 查询；未写入文件。"
+  if [[ "${PROXY_PORT_DEFAULTED:-0}" == 1 ]]; then
+    echo "代理端口配置缺失、为空或无效，按默认 10808 查询；未写入文件。"
   fi
   if [[ "$PORT_CONFIG_VALID" == 0 ]]; then
     echo "端口配置无效；以下运行配置仅供诊断，未修改文件。"
   fi
   if daemon_alive; then
-    python3 - "$ROOT/runtime/xray_config.json" "$SOCKS_PORT" "$HTTP_PORT" "$PORT_CONFIG_VALID" <<'PY_STATUS'
+    python3 - "$ROOT/runtime/xray_config.json" "$PROXY_PORT" "$PORT_CONFIG_VALID" <<'PY_STATUS'
 import json, sys
 try:
     inbounds = json.load(open(sys.argv[1]))['inbounds']
     actual = {(i['protocol'], i.get('listen'), i['port']) for i in inbounds}
-    expected = {('socks', '127.0.0.1', int(sys.argv[2])),
-                ('http', '127.0.0.1', int(sys.argv[3]))}
-    if sys.argv[4] != '1' or actual != expected:
-        if sys.argv[4] == '1':
-            print('端口配置与运行配置不一致；以下监听状态按当前端口配置查询。')
+    expected = {('socks', '127.0.0.1', int(sys.argv[2]))}
+    if sys.argv[3] != '1' or actual != expected:
+        if sys.argv[3] == '1':
+            print('运行配置尚未采用当前单入口方案；以下监听状态按统一端口查询，择机重启后生效。')
         for i in inbounds:
-            protocol = {"socks": "SOCKS5", "http": "HTTP"}.get(i["protocol"], i["protocol"])
+            protocol = {"socks": "SOCKS / HTTP 混合代理", "http": "旧独立 HTTP"}.get(i["protocol"], i["protocol"])
             print(f"运行配置入口: {protocol} {i.get('listen')}:{i['port']}")
 except (OSError, ValueError, KeyError, TypeError):
     print('运行配置不可读')
 PY_STATUS
   fi
   [[ "$PORT_CONFIG_VALID" == 1 ]] || return 0
-  if ( PORT="$HTTP_PORT"; port_open ); then
-    if ( PORT="$HTTP_PORT"; own_listener ); then
-      echo "HTTP 监听: 127.0.0.1:${HTTP_PORT}"
-    else
-      echo "HTTP 端口由其他进程占用: ${HTTP_PORT}"
-    fi
-  else
-    echo "HTTP 未监听: ${HTTP_PORT}"
-  fi
   if port_open; then
     local pid cmd
     if own_listener; then
-      echo "SOCKS5 监听: 127.0.0.1:${PORT}"
+      echo "SOCKS / HTTP 混合代理监听: 127.0.0.1:${PORT}"
     else
-      echo "SOCKS5 监听: 127.0.0.1:${PORT} 已被其他进程占用"
+      echo "SOCKS / HTTP 混合代理监听: 127.0.0.1:${PORT} 已被其他进程占用"
     fi
     pid="$(listener_pid)"
     if [[ -n "$pid" && -r "/proc/${pid}/cmdline" ]]; then
@@ -553,7 +534,7 @@ PY_STATUS
       fi
     fi
   else
-    echo "SOCKS5 监听: 127.0.0.1:${PORT} 未在监听"
+    echo "SOCKS / HTTP 混合代理监听: 127.0.0.1:${PORT} 未在监听"
   fi
 }
 
@@ -561,11 +542,11 @@ usage() {
   cat <<EOF
 用法: $0 <命令>
 
-  start    按 config/active.txt 启动。已在监听时不重复启动。断开远程连接后继续运行
-  stop     停止本项目核心及双入口。依赖该代理的程序随即无法经该代理出网
+  start    按 config/active.txt 启动。已在监听时不重复启动。启动后保持后台运行
+  stop     停止本项目核心及混合代理入口。依赖该代理的程序随即无法经该代理出网
   restart  关闭监听后按 config/active.txt 再启动，然后报告连接是否正常
   status   查看线路、开机自启、终端自动接入代理与监听。不写入日志
-  test     分别检查 HTTP/HTTPS 经 HTTP 入口及 HTTPS 经 SOCKS5 入口，每个入口各显示连接结果及访问 ${PROBE_URL} 的首字节耗时。不改线路，也不启停监听
+  test     分别测试 HTTP 和 SOCKS 代理，均访问 ${PROBE_URL}，显示连接结果和首字节耗时。不改线路，也不启停监听
   switch   询问后切换 vless / hysteria2 / vmess 并保留。选中当前线路时按重启处理。监听起来后报告连接是否正常
   boot     只询问后开启或关闭开机自启。不启动、不停止当前监听
   terminal 询问后开启或关闭新终端自动接入代理。不开启、不关闭监听
@@ -588,7 +569,7 @@ main() {
     restart)
       lock_management
       ensure_port
-      _xray_check_available_ports "$ROOT" "$SOCKS_PORT" "$HTTP_PORT"
+      _xray_check_available_ports "$ROOT" "$PROXY_PORT"
       FRESH_START=0
       stop_proxy
       start_proxy
@@ -600,7 +581,7 @@ main() {
     terminal) terminal_xray ;;
     status) status_xray ;;
     log) tail -n 50 -f "$LOG" ;;
-    __write_proxychains) lock_management; ensure_port; _xray_check_running_ports "$ROOT" "$SOCKS_PORT" "$HTTP_PORT"; sync_proxychains; printf '%s %s\n' "$SOCKS_PORT" "$HTTP_PORT" ;;
+    __write_proxychains) lock_management; ensure_port; _xray_check_running_ports "$ROOT" "$PROXY_PORT"; sync_proxychains; printf '%s\n' "$PROXY_PORT" ;;
     *)
       usage
       exit 1
